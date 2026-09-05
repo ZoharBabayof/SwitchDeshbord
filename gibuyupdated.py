@@ -206,33 +206,16 @@ def normalize_interface_name(interface):
         FastEthernet1/0/1 -> Fa1/0/1
     """
 
-    if interface.startswith("GigabitEthernet"):
-        return interface.replace(
-            "GigabitEthernet",
-            "Gi",
-            1
-        )
+    replacements = {
+        "GigabitEthernet": "Gi",
+        "TenGigabitEthernet": "Te",
+        "TwentyFiveGigE": "Twe",
+        "FastEthernet": "Fa",
+    }
 
-    if interface.startswith("TenGigabitEthernet"):
-        return interface.replace(
-            "TenGigabitEthernet",
-            "Te",
-            1
-        )
-
-    if interface.startswith("TwentyFiveGigE"):
-        return interface.replace(
-            "TwentyFiveGigE",
-            "Twe",
-            1
-        )
-
-    if interface.startswith("FastEthernet"):
-        return interface.replace(
-            "FastEthernet",
-            "Fa",
-            1
-        )
+    for long_name, short_name in replacements.items():
+        if interface.startswith(long_name):
+            return interface.replace(long_name, short_name, 1)
 
     return interface
 
@@ -242,16 +225,18 @@ def is_physical_interface(interface):
     Determine whether an interface is a physical Ethernet interface.
     """
 
-    return (
-        interface.startswith("GigabitEthernet")
-        or interface.startswith("Gi")
-        or interface.startswith("TenGigabitEthernet")
-        or interface.startswith("Te")
-        or interface.startswith("TwentyFiveGigE")
-        or interface.startswith("Twe")
-        or interface.startswith("FastEthernet")
-        or interface.startswith("Fa")
+    prefixes = (
+        "GigabitEthernet",
+        "Gi",
+        "TenGigabitEthernet",
+        "Te",
+        "TwentyFiveGigE",
+        "Twe",
+        "FastEthernet",
+        "Fa",
     )
+
+    return interface.startswith(prefixes)
 
 
 # ============================================================
@@ -261,52 +246,67 @@ def is_physical_interface(interface):
 def parse_interfaces(output):
     """
     Parse:
+
         show interfaces status
 
-    Returns:
-        {
-            "Gi1/0/1": "connected",
-            "Gi1/0/3": "disabled",
-            ...
-        }
+    Cisco format:
+
+        Port       Name                 Status       Vlan
+        Gi1/0/1    PC1_Engineering      connected    100
+        Gi1/0/2    PC2_Engineering      connected    routed
+        Gi1/0/8                         disabled     108
+
+    The interface name is always the first field.
+
+    The status is detected explicitly instead of assuming
+    that the interface name, description and status occupy
+    fixed columns.
     """
 
     interfaces = {}
 
-    for line in output.splitlines():
+    valid_statuses = {
+        "connected": "connected",
+        "notconnect": "unused",
+        "notconnected": "unused",
+        "disabled": "disabled",
+        "err-disabled": "disabled",
+    }
 
+    for line in output.splitlines():
         line = line.strip()
 
         if not line:
             continue
 
-        match = re.match(
-            r"^(Gi\S+|GigabitEthernet\S+|Te\S+|TenGigabitEthernet\S+|"
-            r"Twe\S+|TwentyFiveGigE\S+|Fa\S+|FastEthernet\S+)\s+"
-            r"(\S+)\s+(\S+)",
-            line
-        )
+        parts = line.split()
 
-        if not match:
+        if not parts:
+            continue
+
+        raw_interface = parts[0]
+
+        if not is_physical_interface(raw_interface):
             continue
 
         interface = normalize_interface_name(
-            match.group(1)
+            raw_interface.rstrip(",")
         )
 
-        status = match.group(2).lower()
+        status = None
 
-        if status == "connected":
+        # Search for the Cisco status field anywhere after
+        # the interface name. This handles descriptions with
+        # spaces and empty descriptions.
+        for token in parts[1:]:
+            normalized_token = token.lower().rstrip(",")
 
-            interfaces[interface] = "connected"
+            if normalized_token in valid_statuses:
+                status = valid_statuses[normalized_token]
+                break
 
-        elif status in ("notconnect", "notconnected"):
-
-            interfaces[interface] = "unused"
-
-        elif status in ("disabled", "err-disabled"):
-
-            interfaces[interface] = "disabled"
+        if status is not None:
+            interfaces[interface] = status
 
     return interfaces
 
@@ -314,36 +314,48 @@ def parse_interfaces(output):
 def parse_port_vlans(output):
     """
     Parse access VLANs from:
+
         show vlan
+
+    Example:
+
+        100  Engineering  active  Gi1/0/1, Gi1/0/3
     """
 
     port_vlans = {}
 
     for line in output.splitlines():
-
         line = line.strip()
 
+        if not line:
+            continue
+
         match = re.match(
-            r"^(\d+)\s+\S+\s+\S+\s+(.+)$",
-            line
+            r"^(\d+)\s+(.+?)\s+(active|act/unsup|suspended|"
+            r"act/lshut|shutdown)\s*(.*)$",
+            line,
+            re.IGNORECASE
         )
 
         if not match:
             continue
 
         vlan = match.group(1)
-        ports = match.group(2)
+        ports = match.group(4)
 
         if int(vlan) >= 1002:
             continue
 
-        for port in ports.split():
+        for port in ports.split(","):
+            port = port.strip().rstrip(",")
 
-            if is_physical_interface(port):
+            # Handle whitespace-separated port lists as well.
+            for candidate in port.split():
+                candidate = candidate.strip().rstrip(",")
 
-                port = normalize_interface_name(port)
-
-                port_vlans[port] = vlan
+                if is_physical_interface(candidate):
+                    normalized = normalize_interface_name(candidate)
+                    port_vlans[normalized] = vlan
 
     return port_vlans
 
@@ -351,19 +363,20 @@ def parse_port_vlans(output):
 def parse_vlans(output):
     """
     Parse active VLANs from:
+
         show vlan
     """
 
     vlans = {}
 
     for line in output.splitlines():
-
         line = line.strip()
 
         match = re.match(
             r"^(\d+)\s+(\S.*?)\s+"
             r"(active|act/unsup|suspended|act/lshut|shutdown)\s*(.*)$",
-            line
+            line,
+            re.IGNORECASE
         )
 
         if not match:
@@ -371,13 +384,13 @@ def parse_vlans(output):
 
         vlan_id = int(match.group(1))
         vlan_name = match.group(2).strip()
-        status = match.group(3)
+        status = match.group(3).lower()
 
-        # Ignore legacy VLANs 1002-1005
+        # Ignore legacy VLANs 1002-1005.
         if vlan_id >= 1002:
             continue
 
-        # Only count active VLANs
+        # Only count active VLANs.
         if status != "active":
             continue
 
@@ -389,13 +402,13 @@ def parse_vlans(output):
 def parse_svis(output):
     """
     Parse SVI information from:
+
         show ip interface brief
     """
 
     svis = {}
 
     for line in output.splitlines():
-
         line = line.strip()
 
         match = re.match(
@@ -423,6 +436,7 @@ def parse_svis(output):
 def parse_vtp(output):
     """
     Parse VTP version and operating mode from:
+
         show vtp status
     """
 
@@ -445,7 +459,6 @@ def parse_vtp(output):
     )
 
     if mode_match:
-
         client_mode = (
             1
             if mode_match.group(1).lower() == "client"
@@ -457,32 +470,32 @@ def parse_vtp(output):
 
 def parse_cpu(output):
     """
-    Parse CPU utilization from:
+    Parse the five-second CPU utilization from:
+
         show processes cpu
+
+    Example:
+
+        CPU utilization for five seconds: 0%/0%;
+        one minute: 2%; five minutes: 2%
     """
 
-    patterns = [
-        r"CPU utilization for five seconds:\s*(\d+)%?",
-        r"CPU utilization for five seconds:\s*([\d.]+)%"
-    ]
+    match = re.search(
+        r"CPU utilization for five seconds:\s*(\d+(?:\.\d+)?)%",
+        output,
+        re.IGNORECASE
+    )
 
-    for pattern in patterns:
+    if match:
+        return float(match.group(1))
 
-        match = re.search(
-            pattern,
-            output,
-            re.IGNORECASE
-        )
-
-        if match:
-            return float(match.group(1))
-
-    return 0
+    return 0.0
 
 
 def parse_stp(output):
     """
     Parse global STP settings from:
+
         show spanning-tree summary
     """
 
@@ -506,7 +519,6 @@ def parse_stp(output):
     )
 
     if match:
-
         portfast_default = (
             1
             if match.group(1).lower() == "enabled"
@@ -520,7 +532,6 @@ def parse_stp(output):
     )
 
     if match:
-
         bpdu_guard_default = (
             1
             if match.group(1).lower() == "enabled"
@@ -537,6 +548,7 @@ def parse_stp(output):
 def parse_mst_configuration(output):
     """
     Parse MST region name, revision and instance mappings from:
+
         show spanning-tree mst configuration
     """
 
@@ -546,22 +558,23 @@ def parse_mst_configuration(output):
 
     match = re.search(
         r"Name\s+\[([^\]]+)\]",
-        output
+        output,
+        re.IGNORECASE
     )
 
     if match:
-        region_name = match.group(1)
+        region_name = match.group(1).strip()
 
     match = re.search(
         r"Revision\s+(\d+)",
-        output
+        output,
+        re.IGNORECASE
     )
 
     if match:
         revision = int(match.group(1))
 
     for line in output.splitlines():
-
         line = line.strip()
 
         match = re.match(
@@ -575,7 +588,7 @@ def parse_mst_configuration(output):
         instance = match.group(1)
         mapping = match.group(2).strip()
 
-        if instance in ("0", "1", "2") and mapping:
+        if instance.isdigit() and mapping:
             instances[instance] = mapping
 
     return (
@@ -588,21 +601,25 @@ def parse_mst_configuration(output):
 def parse_interface_security(output):
     """
     Parse per-interface STP security settings from:
+
         show running-config | section interface
     """
 
     interfaces = {}
-
     current_interface = None
 
     for line in output.splitlines():
 
         if line.startswith("interface "):
+            parts = line.split()
 
-            raw_interface = line.split()[1]
+            if len(parts) < 2:
+                current_interface = None
+                continue
+
+            raw_interface = parts[1]
 
             if is_physical_interface(raw_interface):
-
                 current_interface = normalize_interface_name(
                     raw_interface
                 )
@@ -613,9 +630,7 @@ def parse_interface_security(output):
                     "root_guard": 0,
                     "loop_guard": 0
                 }
-
             else:
-
                 current_interface = None
 
             continue
@@ -626,19 +641,15 @@ def parse_interface_security(output):
         stripped = line.strip()
 
         if stripped == "spanning-tree portfast":
-
             interfaces[current_interface]["portfast"] = 1
 
         if stripped == "spanning-tree bpduguard enable":
-
             interfaces[current_interface]["bpdu_guard"] = 1
 
         if "spanning-tree guard root" in stripped:
-
             interfaces[current_interface]["root_guard"] = 1
 
         if "spanning-tree guard loop" in stripped:
-
             interfaces[current_interface]["loop_guard"] = 1
 
     return interfaces
@@ -647,6 +658,7 @@ def parse_interface_security(output):
 def parse_static_routes(output):
     """
     Parse IPv4 static routes from:
+
         show running-config | include ^ip route
 
     VRF-specific static routes are ignored.
@@ -655,14 +667,8 @@ def parse_static_routes(output):
     routes = []
 
     for line in output.splitlines():
-
         line = line.strip()
 
-        # Ignore VRF-specific routes.
-        #
-        # Example:
-        # ip route vrf Mgmt-vrf ...
-        #
         if re.match(
             r"^ip route\s+vrf\s+",
             line,
@@ -675,7 +681,8 @@ def parse_static_routes(output):
             r"(\S+)\s+"
             r"(\S+)\s+"
             r"(\S+)",
-            line
+            line,
+            re.IGNORECASE
         )
 
         if not match:
@@ -697,6 +704,7 @@ def parse_static_routes(output):
 def parse_ios_version(output):
     """
     Parse IOS XE version from:
+
         show version
     """
 
@@ -722,6 +730,44 @@ def parse_ios_version(output):
 
 
 # ============================================================
+# Metric Cleanup
+# ============================================================
+
+def clear_dynamic_metrics():
+    """
+    Clear labelled metrics before publishing a new successful
+    snapshot.
+
+    This prevents stale interfaces, VLANs, routes, or versions
+    from remaining in Prometheus after a configuration change.
+    """
+
+    switch_connected_port.clear()
+    switch_unused_port.clear()
+    switch_disabled_port.clear()
+
+    switch_port_vlan.clear()
+    switch_vlan_configured.clear()
+
+    switch_svi_up.clear()
+    switch_svi_ip_configured.clear()
+
+    switch_static_route.clear()
+
+    switch_mst_region_name.clear()
+    switch_mst_instance_vlan.clear()
+
+    switch_stp_mode.clear()
+
+    switch_interface_portfast.clear()
+    switch_interface_bpdu_guard.clear()
+    switch_interface_root_guard.clear()
+    switch_interface_loop_guard.clear()
+
+    switch_ios_xe_version.clear()
+
+
+# ============================================================
 # Collect Data
 # ============================================================
 
@@ -739,18 +785,11 @@ def collect_switch_data():
     connection = None
 
     try:
+        logging.info("Connecting to Cisco switch...")
 
-        logging.info(
-            "Connecting to Cisco switch..."
-        )
+        connection = ConnectHandler(**device)
 
-        connection = ConnectHandler(
-            **device
-        )
-
-        logging.info(
-            "Connected successfully"
-        )
+        logging.info("Connected successfully")
 
         # ----------------------------------------------------
         # Cisco commands
@@ -853,8 +892,10 @@ def collect_switch_data():
         )
 
         # ----------------------------------------------------
-        # Switch connectivity
+        # New successful snapshot
         # ----------------------------------------------------
+
+        clear_dynamic_metrics()
 
         switch_up.set(1)
 
@@ -984,14 +1025,14 @@ def collect_switch_data():
         # VTP metrics
         # ----------------------------------------------------
 
+        switch_vtp_version_expected.set(
+            EXPECTED_VTP_VERSION
+        )
+
         if vtp_version is not None:
 
             switch_vtp_version.set(
                 vtp_version
-            )
-
-            switch_vtp_version_expected.set(
-                EXPECTED_VTP_VERSION
             )
 
             switch_vtp_version_mismatch.set(
@@ -999,6 +1040,12 @@ def collect_switch_data():
                 if vtp_version != EXPECTED_VTP_VERSION
                 else 0
             )
+
+        else:
+
+            switch_vtp_version.set(0)
+
+            switch_vtp_version_mismatch.set(1)
 
         switch_vtp_client_mode.set(
             vtp_client_mode
@@ -1023,6 +1070,10 @@ def collect_switch_data():
             switch_mst_revision.set(
                 mst_revision
             )
+
+        else:
+
+            switch_mst_revision.set(0)
 
         if mst_region:
 
@@ -1099,10 +1150,32 @@ def collect_switch_data():
         # Summary
         # ----------------------------------------------------
 
+        connected_count = sum(
+            1
+            for status in interfaces.values()
+            if status == "connected"
+        )
+
+        unused_count = sum(
+            1
+            for status in interfaces.values()
+            if status == "unused"
+        )
+
+        disabled_count = sum(
+            1
+            for status in interfaces.values()
+            if status == "disabled"
+        )
+
         logging.info(
-            "Collected: %d interfaces | %d VLANs | %d SVIs | "
-            "%d routes | CPU %.1f%%",
+            "Collected: %d interfaces "
+            "(%d connected, %d unused, %d disabled) | "
+            "%d VLANs | %d SVIs | %d routes | CPU %.1f%%",
             len(interfaces),
+            connected_count,
+            unused_count,
+            disabled_count,
             len(vlans),
             len(svis),
             len(static_routes),
