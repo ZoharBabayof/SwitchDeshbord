@@ -117,9 +117,10 @@ switch_vtp_version_mismatch = Gauge(
     "Whether VTP version differs from expected"
 )
 
-switch_vtp_client_mode = Gauge(
-    "switch_vtp_client_mode",
-    "Whether VTP is running in client mode"
+switch_vtp_mode = Gauge(
+    "switch_vtp_mode",
+    "VTP operating mode",
+    ["mode"]
 )
 
 switch_mst_enabled = Gauge(
@@ -438,10 +439,19 @@ def parse_vtp(output):
     Parse VTP version and operating mode from:
 
         show vtp status
+
+    Supported VTP modes:
+        - Server
+        - Client
+        - Transparent
     """
 
     version = None
-    client_mode = 0
+    mode = None
+
+    # --------------------------------------------------------
+    # VTP version
+    # --------------------------------------------------------
 
     match = re.search(
         r"VTP version running\s*:\s*(\d+)",
@@ -452,20 +462,20 @@ def parse_vtp(output):
     if match:
         version = int(match.group(1))
 
+    # --------------------------------------------------------
+    # VTP operating mode
+    # --------------------------------------------------------
+
     mode_match = re.search(
-        r"VTP Operating Mode\s*:\s*(\S+)",
+        r"VTP Operating Mode\s*:\s*(Server|Client|Transparent)",
         output,
         re.IGNORECASE
     )
 
     if mode_match:
-        client_mode = (
-            1
-            if mode_match.group(1).lower() == "client"
-            else 0
-        )
+        mode = mode_match.group(1).lower()
 
-    return version, client_mode
+    return version, mode
 
 
 def parse_cpu(output):
@@ -756,7 +766,7 @@ def clear_dynamic_metrics():
 
     switch_mst_region_name.clear()
     switch_mst_instance_vlan.clear()
-
+    switch_vtp_mode.clear()
     switch_stp_mode.clear()
 
     switch_interface_portfast.clear()
@@ -855,7 +865,7 @@ def collect_switch_data():
             svi_output
         )
 
-        vtp_version, vtp_client_mode = parse_vtp(
+        vtp_version, vtp_mode = parse_vtp(
             vtp_output
         )
 
@@ -1047,9 +1057,16 @@ def collect_switch_data():
 
             switch_vtp_version_mismatch.set(1)
 
-        switch_vtp_client_mode.set(
-            vtp_client_mode
-        )
+        # ----------------------------------------------------
+        # VTP operating mode
+        # ----------------------------------------------------
+
+        switch_vtp_mode.clear()
+
+        if vtp_mode:
+            switch_vtp_mode.labels(
+                mode=vtp_mode
+            ).set(1)
 
         # ----------------------------------------------------
         # MST metrics
